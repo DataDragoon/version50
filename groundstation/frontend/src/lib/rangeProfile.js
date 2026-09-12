@@ -54,10 +54,11 @@ function ifftInPlace(re, im) {
   }
 }
 
-// Linear amplitude profile plus the distance axis. Everything else here is a
-// view of this: dB is 20*log10 of it, and incoherent averaging has to happen on
-// the linear amplitudes, not on the dB.
-export function computeRangeAmplitude(hCalReal, hCalImag, numSteps, stepSize, rangeOffset, win) {
+// Complex range profile: zero-padded IFFT returning {re, im, distances}.
+// Positive-distance bins only (d >= 0). The window is optional (rectangular
+// when omitted). This is the shared core -- computeRangeAmplitude is a thin
+// wrapper that takes the magnitude.
+export function computeComplexRangeProfile(hCalReal, hCalImag, numSteps, stepSize, rangeOffset, win) {
   const nfftMin = numSteps * 4;
   const nfft = 1 << Math.ceil(Math.log2(nfftMin));
 
@@ -79,14 +80,29 @@ export function computeRangeAmplitude(hCalReal, hCalImag, numSteps, stepSize, ra
 
   const maxRange = SPEED_OF_LIGHT / (2 * stepSize);
   const half = nfft / 2;
-  const amplitudes = [];
+  const outRe = [];
+  const outIm = [];
   const distances = [];
   for (let i = 0; i < half; i++) {
     const d = (i / nfft) * maxRange - rangeOffset;
     if (d >= 0) {
-      amplitudes.push(Math.sqrt(re[i] * re[i] + im[i] * im[i]));
+      outRe.push(re[i]);
+      outIm.push(im[i]);
       distances.push(d);
     }
+  }
+  return { re: outRe, im: outIm, distances };
+}
+
+// Linear amplitude profile plus the distance axis. Everything else here is a
+// view of this: dB is 20*log10 of it, and incoherent averaging has to happen on
+// the linear amplitudes, not on the dB.
+export function computeRangeAmplitude(hCalReal, hCalImag, numSteps, stepSize, rangeOffset, win) {
+  const { re, im, distances } = computeComplexRangeProfile(
+    hCalReal, hCalImag, numSteps, stepSize, rangeOffset, win);
+  const amplitudes = new Array(re.length);
+  for (let i = 0; i < re.length; i++) {
+    amplitudes[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
   }
   return { amplitudes, distances };
 }

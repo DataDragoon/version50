@@ -39,7 +39,7 @@ export default function CscanPanel({
 }) {
   const {
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
-    focusEnabled, focusAperture,
+    focusEnabled, focusAperture, focusMethod, focusGamma,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
     roverTraverse, roverSpeedMmS, roverLatencyMs, roverRunupExtraMs,
   } = params;
@@ -1009,13 +1009,15 @@ export default function CscanPanel({
         </button>
       </Section>
 
-      {/* Plan-view focusing. Same synthetic-aperture kernel the 2D Map uses
-          (lib/saft.js, one implementation), applied to each grid ROW on its
-          own -- a row is a line of positions at one height, which is the
-          geometry the back-projection assumes. It reduces each cell to a
-          colour differently; it does not touch the B-scan pane, whose traces
-          stay exactly as recorded. */}
-      <Section label="Focus (SAFT)">
+      {/* Plan-view focusing, applied to each grid ROW on its own -- a row is a
+          line of positions at one height, which is the geometry the
+          back-projection assumes. SAFT is the same incoherent kernel the 2D
+          Map uses (lib/saft.js, one implementation); DAS+CF and DMAS+CF are
+          coherent (phase-based) alternatives available only here, since they
+          need a complex range profile the 2D Map's magnitude-only traces
+          don't carry. All three reduce each cell to a colour differently; none
+          touch the B-scan pane, whose traces stay exactly as recorded. */}
+      <Section label="Focus">
         <button
           onClick={() => update('focusEnabled', !focusEnabled)}
           disabled={hCount < 3}
@@ -1032,6 +1034,34 @@ export default function CscanPanel({
         </button>
         {focusEnabled && (
           <>
+            <div className="flex gap-2">
+              {[['saft', 'SAFT'], ['das_cf', 'DAS+CF'], ['dmas_cf', 'DMAS+CF']].map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => update('focusMethod', key)}
+                  className={cn(
+                    'flex-1 px-2 py-2 rounded-lg text-xs font-medium transition-all border',
+                    (focusMethod || 'saft') === key
+                      ? 'bg-purple-500/10 border-purple-500/30 text-purple-400'
+                      : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80'
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {(focusMethod || 'saft') !== 'saft' && (
+              <SliderRow
+                label="CF Gamma"
+                value={focusGamma != null ? focusGamma : 1.0}
+                unit=""
+                min={0}
+                max={3}
+                step={0.1}
+                onChange={(v) => update('focusGamma', v)}
+                accent="amber"
+              />
+            )}
             <SliderRow
               label="Aperture (neighbours)"
               value={focusAperture}

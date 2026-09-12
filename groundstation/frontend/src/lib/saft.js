@@ -121,3 +121,174 @@ export function gateDepths(distances, gateStartM, gateEndM) {
   }
   return out;
 }
+
+// ── Coherent focusing helpers ─────────────────────────────────────────
+//
+// DAS+CF and DMAS+CF operate on COMPLEX range profiles, not magnitudes.
+// traces entries must carry { n, cre, cim, cdists } (complex profile)
+// alongside the existing { magnitudes, distances }.
+
+// Linear interpolation of a complex range profile at an arbitrary range.
+// Returns { re, im } or null when off the ends of the record.
+export function interpComplexAtRange(cre, cim, dists, R) {
+  const n = dists.length;
+  if (R < dists[0] || R > dists[n - 1]) return null;
+  let lo = 0, hi = n - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (dists[mid] <= R) lo = mid;
+    else hi = mid;
+  }
+  const t = (R - dists[lo]) / (dists[hi] - dists[lo] + 1e-15);
+  return {
+    re: cre[lo] + t * (cre[hi] - cre[lo]),
+    im: cim[lo] + t * (cim[hi] - cim[lo]),
+  };
+}
+
+// DAS + CF^gamma focused profile.
+//
+// DAS(d) = Σ_p z_p(R_p) * exp(j*2*k_start*R_p) * w_p
+// CF(d)  = |Σ z_p|^2 / (N * Σ |z_p|^2)
+// out    = |DAS| * CF^gamma   (in dB)
+//
+// Returns Float64Array of dB values, same shape as saftFocusedProfile.
+export function dasCFProfile(traces, idx, gateDepths, stepM, halfAperture, gamma, kStart) {
+  const self = traces[idx];
+  const out = new Float64Array(gateDepths.length);
+  const nLo = self.n - halfAperture;
+  const nHi = self.n + halfAperture;
+
+  for (let di = 0; di < gateDepths.length; di++) {
+    const d = gateDepths[di];
+    if (d < 1e-6) { out[di] = -Infinity; continue; }
+
+    let sumRe = 0, sumIm = 0;
+    let sumAbsSq = 0;
+    let N = 0;
+
+    for (let k = 0; k < traces.length; k++) {
+      const t = traces[k];
+      if (t.n < nLo) continue;
+      if (t.n > nHi) break;
+      if (!t.cre || !t.cim || !t.cdists) continue;
+
+      const dx = (t.n - self.n) * stepM;
+      const R = Math.sqrt(dx * dx + d * d);
+      const obliquity = (d * d) / (R * R);
+
+      const z = interpComplexAtRange(t.cre, t.cim, t.cdists, R);
+      if (!z) continue;
+
+      const phase = 2 * kStart * R;
+      const cosP = Math.cos(phase), sinP = Math.sin(phase);
+      const zRe = (z.re * cosP - z.im * sinP) * obliquity;
+      const zIm = (z.re * sinP + z.im * cosP) * obliquity;
+
+      sumRe += zRe;
+      sumIm += zIm;
+      sumAbsSq += zRe * zRe + zIm * zIm;
+      N++;
+    }
+
+    if (N < 2) {
+      const mag = Math.sqrt(sumRe * sumRe + sumIm * sumIm);
+      out[di] = 20 * Math.log10(mag + 1e-12);
+      continue;
+    }
+
+    const cohMag = Math.sqrt(sumRe * sumRe + sumIm * sumIm);
+    const cf = sumAbsSq > 0 ? (cohMag * cohMag) / (N * sumAbsSq) : 0;
+    const weighted = cohMag * Math.pow(Math.max(cf, 1e-12), gamma);
+    out[di] = 20 * Math.log10(weighted + 1e-12);
+  }
+  return out;
+}
+
+// DMAS + CF^gamma focused profile.
+//
+// Sums ALL pairwise products:
+//   DMAS(d) = Σ_{p<q} sign(z_p * conj(z_q)) * sqrt(|z_p * z_q|)
+// CF is computed from the DAS sum (same definition, independent of DMAS).
+//
+// Returns Float64Array of dB values, same shape as saftFocusedProfile.
+export function dmasCFProfile(traces, idx, gateDepths, stepM, halfAperture, gamma, kStart) {
+  const self = traces[idx];
+  const out = new Float64Array(gateDepths.length);
+  const nLo = self.n - halfAperture;
+  const nHi = self.n + halfAperture;
+
+  const contribs = [];
+
+  for (let di = 0; di < gateDepths.length; di++) {
+    const d = gateDepths[di];
+    if (d < 1e-6) { out[di] = -Infinity; continue; }
+
+    contribs.length = 0;
+
+    for (let k = 0; k < traces.length; k++) {
+      const t = traces[k];
+      if (t.n < nLo) continue;
+      if (t.n > nHi) break;
+      if (!t.cre || !t.cim || !t.cdists) continue;
+
+      const dx = (t.n - self.n) * stepM;
+      const R = Math.sqrt(dx * dx + d * d);
+      const obliquity = (d * d) / (R * R);
+
+      const z = interpComplexAtRange(t.cre, t.cim, t.cdists, R);
+      if (!z) continue;
+
+      const phase = 2 * kStart * R;
+      const cosP = Math.cos(phase), sinP = Math.sin(phase);
+      contribs.push({
+        re: (z.re * cosP - z.im * sinP) * obliquity,
+        im: (z.re * sinP + z.im * cosP) * obliquity,
+      });
+    }
+
+    const N = contribs.length;
+    if (N < 2) {
+      if (N === 1) {
+        const mag = Math.sqrt(contribs[0].re * contribs[0].re + contribs[0].im * contribs[0].im);
+        out[di] = 20 * Math.log10(mag + 1e-12);
+      } else {
+        out[di] = -Infinity;
+      }
+      continue;
+    }
+
+    // DMAS: pairwise products
+    let dmasRe = 0, dmasIm = 0;
+
+    // DAS sum for the CF
+    let dasRe = 0, dasIm = 0, sumAbsSq = 0;
+    for (let p = 0; p < N; p++) {
+      dasRe += contribs[p].re;
+      dasIm += contribs[p].im;
+      sumAbsSq += contribs[p].re * contribs[p].re + contribs[p].im * contribs[p].im;
+    }
+
+    for (let p = 0; p < N - 1; p++) {
+      for (let q = p + 1; q < N; q++) {
+        const prodRe = contribs[p].re * contribs[q].re + contribs[p].im * contribs[q].im;
+        const prodIm = contribs[p].im * contribs[q].re - contribs[p].re * contribs[q].im;
+        const prodMag = Math.sqrt(prodRe * prodRe + prodIm * prodIm);
+
+        if (prodMag > 1e-20) {
+          const sqrtMag = Math.sqrt(prodMag);
+          dmasRe += (prodRe / prodMag) * sqrtMag;
+          dmasIm += (prodIm / prodMag) * sqrtMag;
+        }
+      }
+    }
+
+    const dmasMag = Math.sqrt(dmasRe * dmasRe + dmasIm * dmasIm);
+
+    const dasMag = Math.sqrt(dasRe * dasRe + dasIm * dasIm);
+    const cf = sumAbsSq > 0 ? (dasMag * dasMag) / (N * sumAbsSq) : 0;
+    const weighted = dmasMag * Math.pow(Math.max(cf, 1e-12), gamma);
+    out[di] = 20 * Math.log10(weighted + 1e-12);
+  }
+  return out;
+}

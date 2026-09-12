@@ -48,6 +48,7 @@ export default function Viewport({
   bscanBgSubMode,
   cscanSharedScale,
   bscanParams,
+  cscanFocusParams,
   bscanCapturing,
   roverScan,
   bscanScaleMode,
@@ -470,7 +471,7 @@ export default function Viewport({
               )}
               <CscanDisplay
                 scanData={bscanData}
-                params={bscanParams}
+                params={cscanFocusParams}
                 capturing={bscanCapturing}
                 sfcwProgress={sfcwProgress}
                 scaleMode={bscanScaleMode}

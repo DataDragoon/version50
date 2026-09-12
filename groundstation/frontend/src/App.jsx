@@ -632,11 +632,15 @@ export default function App() {
     gateStart: 2,
     gateEnd: 70,
     metric: 'peak',
-    // Plan-view focusing (SAFT), per row. Same kind of setting as metric and
-    // the gate -- it changes how a record is reduced to a colour, not the
-    // record -- so it lives here and rides along in the export.
+    // Plan-view focusing, per row. Same kind of setting as metric and the
+    // gate -- it changes how a record is reduced to a colour, not the record
+    // -- so it lives here and rides along in the export. 'saft' is the
+    // original incoherent kernel; 'das_cf' / 'dmas_cf' are coherent
+    // (phase-aware) alternatives weighted by CF^focusGamma (lib/saft.js).
     focusEnabled: false,
     focusAperture: 7,
+    focusMethod: 'saft',
+    focusGamma: 1.0,
     // How the raster is driven. 'manual' is the hand-held original: the
     // operator places the head and presses Capture, snaking up from the
     // bottom-left. 'rover' hands the same grid to the gantry, which rasters it
@@ -1054,20 +1058,30 @@ export default function App() {
     [cscanProcessedData],
   );
 
+  // bscanParams plus the two other settings the coherent focus kernels
+  // (das_cf / dmas_cf) need but that live in different state: the window
+  // (bscanProcParams, shared with the Live Sweep controls) and the sweep's
+  // start frequency (sfcwParams, needed for the phase term 2*k_start*R).
+  // computeCellValues is the single source of a cell's colour, called both
+  // to draw the grid and to compute its scale -- both call sites use THIS
+  // object so a coherent-mode image can never be drawn with different
+  // window/frequency assumptions than the scale it is drawn against.
+  const cscanFocusParams = useMemo(
+    () => ({
+      ...bscanParams,
+      windowType: bscanProcParams.windowType,
+      kaiserBeta: bscanProcParams.kaiserBeta,
+      startFreqHz: sfcwParams.startFreq * 1e6,
+    }),
+    [bscanParams, bscanProcParams.windowType, bscanProcParams.kaiserBeta, sfcwParams.startFreq],
+  );
+
   // The plan view's own population: one gated scalar per cell, global and
   // per-row. Depends on the gate and the metric, which the bin-domain scales do
   // not -- that asymmetry IS the unlinked mode.
   const cscanGridScales = useMemo(
-    () => computeGridScales(cscanProcessedData, {
-      gateStart: bscanParams.gateStart,
-      gateEnd: bscanParams.gateEnd,
-      metric: bscanParams.metric,
-      hStep: bscanParams.hStep,
-      focusEnabled: bscanParams.focusEnabled,
-      focusAperture: bscanParams.focusAperture,
-    }),
-    [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric,
-      bscanParams.hStep, bscanParams.focusEnabled, bscanParams.focusAperture],
+    () => computeGridScales(cscanProcessedData, cscanFocusParams),
+    [cscanProcessedData, cscanFocusParams],
   );
 
   // Which of those the plan view actually draws with. Shared with the viewport
@@ -2065,7 +2079,7 @@ export default function App() {
                 const {
                   stepSize, numPositions, maxDepth, wallThickness,
                   hCount, hStep, vCount, vStep, gateStart, gateEnd, metric,
-                  focusEnabled, focusAperture,
+                  focusEnabled, focusAperture, focusMethod, focusGamma,
                 } = imported.params;
                 // v3 and earlier called it wallThickness. It is no longer a
                 // C-scan parameter at all -- it only ever bounded SAR's
@@ -2085,6 +2099,8 @@ export default function App() {
                   ...(metric != null && { metric }),
                   ...(focusEnabled != null && { focusEnabled }),
                   ...(focusAperture != null && { focusAperture }),
+                  ...(focusMethod != null && { focusMethod }),
+                  ...(focusGamma != null && { focusGamma }),
                 }));
               }
             }
@@ -2387,6 +2403,7 @@ export default function App() {
         bgApplied={bgApplied}
         onBgAppliedChange={setBgApplied}
         bscanParams={bscanParams}
+        cscanFocusParams={cscanFocusParams}
         onBscanParamsChange={setBscanParams}
         onBscanAction={handleBscanAction}
         roverScan={roverScan}
@@ -2598,7 +2615,7 @@ export default function App() {
           <CscanDisplay
             chromeless
             scanData={cscanProcessedData}
-            params={bscanParams}
+            params={cscanFocusParams}
             scaleMode={bscanScaleMode}
             scaleRange={bscanScaleRange}
             sharedScale={cscanPlanScales.global}

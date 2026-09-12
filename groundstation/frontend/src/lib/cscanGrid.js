@@ -1,4 +1,8 @@
-import { saftFocusedProfile, metricOnProfile, gateDepths } from './saft';
+import { saftFocusedProfile, metricOnProfile, gateDepths, dasCFProfile, dmasCFProfile } from './saft';
+import { computeComplexRangeProfile } from './rangeProfile';
+import { windowFn } from './imagingEffects';
+
+const SPEED_OF_LIGHT = 299792458;
 
 // C-scan grid geometry.
 //
@@ -148,6 +152,13 @@ export const BG_STATUS_TEXT = {
 // row with holes in it (an undone cell, a partial raster) still gets the right
 // spacing instead of closing the gap up.
 //
+// `focusMethod` picks the kernel: 'saft' (default) is the incoherent,
+// magnitude-domain back-projection above; 'das_cf' and 'dmas_cf' are coherent
+// (phase-aware) alternatives from lib/saft.js, weighted by a coherence factor
+// CF^focusGamma that suppresses depths where the aperture disagrees. They need
+// a complex range profile per trace (built here from h_cal, windowed exactly
+// like the live display) rather than the magnitude profile SAFT reads.
+//
 // A cell whose background failed contributes to nothing: it is un-subtracted
 // and sits 20-30 dB above its neighbours, so letting it into an aperture would
 // smear that error across every cell within half an aperture of it.
@@ -169,6 +180,22 @@ export function computeCellValues(scanData, params) {
 
   const stepM = (params.hStep > 0 ? params.hStep : 1) / 100;
   const halfAp = Math.floor(params.focusAperture / 2);
+  const method = params.focusMethod || 'saft';
+  const gamma = params.focusGamma != null ? params.focusGamma : 1.0;
+  const coherent = method === 'das_cf' || method === 'dmas_cf';
+
+  // DAS+CF and DMAS+CF need a COMPLEX range profile per trace, not just the
+  // magnitude one already stored on each cell -- built here from the raw
+  // h_cal rather than recomputed by every downstream caller, the same
+  // "single source of the number a cell is coloured by" rule the rest of
+  // this function already follows. Skipped entirely for SAFT, which stays
+  // magnitude-domain and unchanged.
+  let makeWin = null;
+  let kStart = 0;
+  if (coherent) {
+    makeWin = windowFn(params.windowType || 'rectangular', params.kaiserBeta != null ? params.kaiserBeta : 3);
+    kStart = 2 * Math.PI * (params.startFreqHz || 2e9) / SPEED_OF_LIGHT;
+  }
 
   const rows = new Map();
   for (let i = 0; i < scanData.length; i++) {
@@ -178,12 +205,22 @@ export function computeCellValues(scanData, params) {
     const iy = pos.grid_iy != null ? pos.grid_iy : 0;
     let row = rows.get(iy);
     if (!row) { row = []; rows.set(iy, row); }
-    row.push({
+    const trace = {
       i,
       n: pos.grid_ix != null ? pos.grid_ix : i,
       magnitudes: pos.magnitudes,
       distances: pos.distances,
-    });
+    };
+    if (coherent && pos.h_cal_real && pos.h_cal_imag) {
+      const ns = pos.h_cal_real.length;
+      const win = makeWin(ns);
+      const cp = computeComplexRangeProfile(
+        pos.h_cal_real, pos.h_cal_imag, ns, pos.step_size, pos.range_offset, win);
+      trace.cre = cp.re;
+      trace.cim = cp.im;
+      trace.cdists = cp.distances;
+    }
+    row.push(trace);
   }
 
   for (const traces of rows.values()) {
@@ -194,8 +231,15 @@ export function computeCellValues(scanData, params) {
     const depths = gateDepths(traces[0].distances, gateStartM, gateEndM);
     if (depths.length === 0) continue;
     for (let k = 0; k < traces.length; k++) {
-      out[traces[k].i] = metricOnProfile(
-        saftFocusedProfile(traces, k, depths, stepM, halfAp), metric);
+      let profile;
+      if (method === 'das_cf') {
+        profile = dasCFProfile(traces, k, depths, stepM, halfAp, gamma, kStart);
+      } else if (method === 'dmas_cf') {
+        profile = dmasCFProfile(traces, k, depths, stepM, halfAp, gamma, kStart);
+      } else {
+        profile = saftFocusedProfile(traces, k, depths, stepM, halfAp);
+      }
+      out[traces[k].i] = metricOnProfile(profile, metric);
     }
   }
   return out;
