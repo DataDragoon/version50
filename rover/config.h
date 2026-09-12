@@ -9,10 +9,10 @@
 // ── CNC Shield V3 pin map ───────────────────────────────────────────────────
 // The shield's four driver sockets are labelled X/Y/Z/A. Which socket drives
 // which AXIS is a wiring fact, recorded below under "axis assignment".
-#define PIN_X_STEP   2
-#define PIN_X_DIR    5
-#define PIN_Y_STEP   3
-#define PIN_Y_DIR    6
+#define PIN_X_STEP   3
+#define PIN_X_DIR    6
+#define PIN_Y_STEP   2
+#define PIN_Y_DIR    5
 #define PIN_Z_STEP   4
 #define PIN_Z_DIR    7
 #define PIN_A_STEP  12
@@ -61,8 +61,16 @@
 // the wire mean the same thing to everyone.
 // Both verified on the rig 2026-08-29 by nudging each axis and watching the
 // head. Y was correct as shipped; X was reversed and is now inverted too.
-#define V_DIR_INVERT true
+#define V_DIR_INVERT false
 #define H_DIR_INVERT true
+
+// Per-motor flip for the three ganged horizontal wheel motors, applied on
+// top of H_DIR_INVERT. The rear pair face each other, so they do not all
+// take the same DIR level. Set true for whichever socket runs backwards, and
+// re-verify by nudging 1 mm and watching after any driver is reseated.
+#define H_INVERT_Y true
+#define H_INVERT_Z true
+#define H_INVERT_A false
 
 // ── Motion defaults, in mm ──────────────────────────────────────────────────
 // Chosen against the real travel (vertical 1 m, horizontal 4 m) so that the
@@ -199,10 +207,39 @@
 #define NET_SCAN_EVERY 4
 
 // ── Protocol / networking ───────────────────────────────────────────────────
-#define FIRMWARE_VERSION "2.0.0"
+// ── Yaw trim: differential drive of the rear wheels (added 2.5.0) ───────────
+// Wheel layout, like an auto-rickshaw: one wheel in front, two at the rear.
+//   socket Y (pins 2/5)   = FRONT wheel (single)
+//   socket Z (pins 4/7)   = REAR RIGHT wheel
+//   socket A (pins 12/13) = REAR LEFT wheel
+// All three are driven; none steers. The chassis yaws when the two rear wheels
+// turn at different rates, so a persistent drift away from parallel is
+// corrected by running one rear wheel a little faster than the other. The
+// front wheel and the position count both run at the BASE rate, so trim never
+// disturbs the odometry -- the front wheel scrubs slightly instead.
+//
+// Trim is a signed percentage of that base rate, pushed by the Pi in `cfg` as
+// "yaw", or on its own with the `trim` command (which is what the closed loop
+// in pi/rover/yaw_control.py uses, a few times a second while moving). The Pi
+// persists it; the board does not. Convention:
+//   yaw > 0  ->  LEFT rear (A) faster, RIGHT rear (Z) slower  ->  nose turns RIGHT
+//   yaw < 0  ->  the opposite                                 ->  nose turns LEFT
+// If the rig turns the wrong way for the sign, flip YAW_TRIM_INVERT rather
+// than re-learning the panel.
+#define YAW_TRIM_MAX_PCT 30
+#define YAW_TRIM_INVERT false
+
+// 2.5.0 = 2.0.0 (the network recovery ladder) + yaw trim + the 2026-09-12
+// wiring. It is NOT the 2.4.x lineage, which carries the same yaw trim on a
+// 2.0.0 that has no ladder -- see the firmware lineage note in CLAUDE.md.
+#define FIRMWARE_VERSION "2.5.0"
 #define STATUS_INTERVAL_MS 50        // 20 Hz position feedback
 #define CMD_QUEUE_DEPTH 4            // lets the Pi pipeline raster moves
-#define RX_BUFFER_SIZE 256
+// 2.5.0: 256 -> 320. A cfg at the extremes of the Pi's CONFIG_BOUNDS plus the
+// new "yaw" field measures 264 bytes; the everyday cfg is ~210. 64 bytes of
+// stack. The Pi's BOARD_RX_LIMIT mirrors this and the two MUST agree, or an
+// oversized command is rejected with nothing but one line in the board log.
+#define RX_BUFFER_SIZE 320
 #define TX_BUFFER_SIZE 384
 
 // De-energise the drivers after this long with no motion. 0 disables the

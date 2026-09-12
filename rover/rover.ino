@@ -116,13 +116,43 @@ static char txBuf[TX_BUFFER_SIZE];
 
 // ── pin helpers ─────────────────────────────────────────────────────────────
 
+// pulseMask bits: 0x01 X (vertical), 0x02 Y (front wheel), 0x04 Z (rear
+// right), 0x08 A (rear left). The three horizontal wheels are pulsed
+// separately since 2.5.0 so the rear pair can run at different rates -- see
+// YAW TRIM in config.h.
 static inline void stepPinsLow(uint8_t mask) {
     if (mask & 0x01) digitalWrite(PIN_X_STEP, LOW);
-    if (mask & 0x02) {
-        digitalWrite(PIN_Y_STEP, LOW);
-        digitalWrite(PIN_Z_STEP, LOW);
-        digitalWrite(PIN_A_STEP, LOW);
-    }
+    if (mask & 0x02) digitalWrite(PIN_Y_STEP, LOW);
+    if (mask & 0x04) digitalWrite(PIN_Z_STEP, LOW);
+    if (mask & 0x08) digitalWrite(PIN_A_STEP, LOW);
+}
+
+// ── yaw trim ─────────────────────────────────────────────────────────────────
+// The horizontal Axis object generates the BASE step rate: its phase
+// accumulator drives the front wheel and the position count. Each rear wheel
+// has its own accumulator fed with that base rate scaled by (1 -/+ trim), in
+// 10-bit fixed point (1024 = 1.0). At trim 0 all three wheels step at the same
+// rate and this is exactly the old behaviour. The scales are written from the
+// main loop inside a critical section and only read in the ISR.
+static const uint32_t YAW_ONE = 1024;
+static volatile uint32_t rearRightScale = YAW_ONE;   // Z
+static volatile uint32_t rearLeftScale  = YAW_ONE;   // A
+static uint32_t rearRightPhase = 0;                  // ISR-only
+static uint32_t rearLeftPhase  = 0;                  // ISR-only
+static int8_t yawTrimPct = 0;                        // as last accepted
+
+static void setYawTrim(int32_t pct) {
+    if (pct >  YAW_TRIM_MAX_PCT) pct =  YAW_TRIM_MAX_PCT;
+    if (pct < -YAW_TRIM_MAX_PCT) pct = -YAW_TRIM_MAX_PCT;
+    yawTrimPct = (int8_t)pct;
+    const int32_t t = YAW_TRIM_INVERT ? -pct : pct;
+    // yaw > 0: left rear faster, right rear slower.
+    const uint32_t left  = (uint32_t)((int32_t)YAW_ONE * (100 + t) / 100);
+    const uint32_t right = (uint32_t)((int32_t)YAW_ONE * (100 - t) / 100);
+    noInterrupts();
+    rearLeftScale  = left;
+    rearRightScale = right;
+    interrupts();
 }
 
 static inline void applyDirection(uint8_t axis) {
@@ -134,9 +164,9 @@ static inline void applyDirection(uint8_t axis) {
     if (axis == AXIS_V) {
         digitalWrite(PIN_X_DIR, high ? HIGH : LOW);
     } else {
-        digitalWrite(PIN_Y_DIR, high ? HIGH : LOW);
-        digitalWrite(PIN_Z_DIR, high ? HIGH : LOW);
-        digitalWrite(PIN_A_DIR, high ? HIGH : LOW);
+        digitalWrite(PIN_Y_DIR, (high != H_INVERT_Y) ? HIGH : LOW);
+        digitalWrite(PIN_Z_DIR, (high != H_INVERT_Z) ? HIGH : LOW);
+        digitalWrite(PIN_A_DIR, (high != H_INVERT_A) ? HIGH : LOW);
     }
 }
 
@@ -186,10 +216,29 @@ void onStepTimer(timer_callback_args_t* /*args*/) {
     }
     if (axes[AXIS_H].tick(isrMs)) {
         applyDirection(AXIS_H);
-        digitalWrite(PIN_Y_STEP, HIGH);
-        digitalWrite(PIN_Z_STEP, HIGH);
-        digitalWrite(PIN_A_STEP, HIGH);
+        digitalWrite(PIN_Y_STEP, HIGH);          // front wheel: base rate
         pulseMask |= 0x02;
+    }
+    // Rear wheels: same direction, own rate. phase_inc is the axis's current
+    // base rate and is exactly 0 whenever the axis is idle, so nothing here can
+    // pulse a wheel the axis is not driving. 64-bit product: at the step
+    // generator's ceiling phase_inc reaches 2^24, and 2^24 * 1331 overflows 32.
+    const uint32_t inc = axes[AXIS_H].phase_inc;
+    if (inc) {
+        rearRightPhase += (uint32_t)(((uint64_t)inc * rearRightScale) >> 10);
+        if (rearRightPhase >= PHASE_ONE) {
+            rearRightPhase -= PHASE_ONE;
+            applyDirection(AXIS_H);
+            digitalWrite(PIN_Z_STEP, HIGH);
+            pulseMask |= 0x04;
+        }
+        rearLeftPhase += (uint32_t)(((uint64_t)inc * rearLeftScale) >> 10);
+        if (rearLeftPhase >= PHASE_ONE) {
+            rearLeftPhase -= PHASE_ONE;
+            applyDirection(AXIS_H);
+            digitalWrite(PIN_A_STEP, HIGH);
+            pulseMask |= 0x08;
+        }
     }
 }
 
@@ -278,6 +327,7 @@ static void sendHello() {
     w.f("h_jog", axes[AXIS_H].p.jog_speed, 1);
     w.f("h_accel", axes[AXIS_H].p.accel, 1);
     w.boolean("limits", axes[AXIS_V].p.limits_enabled);
+    w.i32("yaw", yawTrimPct);
     w.boolean("pos_valid", positionValid);
     w.boolean("estop", estopLatched);
     w.u32("ms", nowMs());
@@ -306,6 +356,9 @@ static void sendStatus() {
     w.boolean("en", driversEnabled);
     w.boolean("pos_valid", positionValid);
     w.u32("idle_ms", idleDisableMs);
+    // The Pi owns and persists the trim; echoing it back is how the panel shows
+    // what the board is really holding, as distinct from what was last sent.
+    w.i32("yaw", yawTrimPct);
     w.i32("q", (int32_t)qCount);
     w.u32("ms", nowMs());
     w.end();
@@ -584,12 +637,28 @@ static void handleCommand(const char* json) {
         axes[AXIS_V].p = v;
         axes[AXIS_H].p = h;
         interrupts();
+        int32_t yaw;
+        if (proto::getInt32(json, "yaw", &yaw)) setYawTrim(yaw);
         sendAck(seq);
         // Reply with status, NOT hello. The Pi pushes its configuration in
         // response to a hello, so answering cfg with one puts the two in a
         // tight cfg -> hello -> cfg loop that saturates the link. `hello` means
         // "this connection just came up" and nothing else.
         sendStatus();
+        return;
+    }
+
+    // Live yaw trim on its own: ~40 bytes instead of a full cfg, for the Pi's
+    // closed loop (pi/rover/yaw_control.py), which adjusts it a few times a
+    // second while the rover is moving.
+    if (strcmp(cmd, "trim") == 0) {
+        int32_t yaw;
+        if (!proto::getInt32(json, "yaw", &yaw)) {
+            sendError(seq, "bad_msg", "trim needs yaw");
+            return;
+        }
+        setYawTrim(yaw);
+        sendAck(seq);
         return;
     }
 

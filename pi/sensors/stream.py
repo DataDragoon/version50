@@ -163,12 +163,15 @@ async def imu_poll_loop(imu, state):
             state['accel'] = body['accel'].tolist()
             state['gyro'] = body['gyro'].tolist()
             state['temp'] = body['temp']
+            state['yaw_deg'] = body.get('yaw_deg')
+            state['quat'] = body.get('quat')
             fail_streak = 0
         except Exception as e:
             fail_streak += 1
             if fail_streak == 1:
                 print(f"WARNING: IMU read failed ({e!r}), streaming IMU as null")
             state['accel'] = state['gyro'] = state['temp'] = None
+            state['yaw_deg'] = state['quat'] = None
             if fail_streak >= IMU_FAIL_LIMIT:
                 print(f"IMU failed {IMU_FAIL_LIMIT} reads in a row, giving up on it")
                 return
@@ -307,7 +310,7 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     interval = 1.0 / rate
     print(f"Streaming sensors at {rate}Hz on ws://0.0.0.0:9001")
 
-    imu_state = {'accel': None, 'gyro': None, 'temp': None}
+    imu_state = {'accel': None, 'gyro': None, 'temp': None, 'yaw_deg': None, 'quat': None}
     # seq increments once per distinct MEASUREMENT (see lidar_poll_loop), so a
     # consumer can dedupe both the repeats that come from broadcasting faster
     # than the LiDAR updates and the repeats that come from polling faster.
@@ -327,6 +330,12 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
                 'accel': imu_state['accel'],
                 'gyro': imu_state['gyro'],
                 'temp': imu_state['temp'],
+                # Heading from the BNO085's own gyro+accel fusion (game rotation
+                # vector): degrees, CCW positive, relative to its last reset.
+                # None when the IMU is absent or the rotation report is not
+                # enabled. rover_server's yaw controller consumes this.
+                'yaw_deg': imu_state['yaw_deg'],
+                'quat': imu_state['quat'],
                 'lidar': lidar_state['dist'],
                 # Provenance for the LiDAR sample: seq identifies the
                 # MEASUREMENT and ts is when that measurement was first seen

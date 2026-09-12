@@ -183,6 +183,10 @@ class CalibratedIMU:
             'accel': accel,
             'gyro': gyro,
             'temp': data['temp'],
+            # Pass-through from the sensor's own fusion; not remapped (it is a
+            # heading about the sensor's Z, which is up on this mount).
+            'yaw_deg': data.get('yaw_deg'),
+            'quat': data.get('quat'),
         }
 
     def read_body(self):
@@ -202,6 +206,8 @@ class CalibratedIMU:
             'accel': accel_body,
             'gyro': gyro_body,
             'temp': raw['temp'],
+            'yaw_deg': raw.get('yaw_deg'),
+            'quat': raw.get('quat'),
         }
 
     def close(self):

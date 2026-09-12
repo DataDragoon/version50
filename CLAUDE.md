@@ -620,6 +620,96 @@ The panel is the source of truth; keep new SFCW params in that payload or they w
 reach the Pi.
 Next steps: SAR reconstruction integration.
 
+## Rover steering: yaw trim + closed loop (ported from `moving_stuff`, 2026-09-13)
+
+`pi/rover/yaw_control.py`, `rover_server.py`'s yaw plumbing, the panel's Steering
+Trim section, and firmware yaw trim. The rover has one driven front wheel and two
+driven rear wheels on separate axles; **nothing steers**. The chassis yaws when the
+rear pair run at different rates, and that is the only steering authority there is.
+Full description in CONTEXT.md ("Steering: three modes" and "Yaw trim").
+
+Three modes, each strictly more capable: `manual` (a number the operator tuned by
+eye), `heading` (hold the BNO085 heading — fixes travelling SLANTED), `track`
+(cascade the LiDAR standoff into the heading reference — also fixes being on the
+wrong LINE). Mode is a **command, never persisted**, because the references do not
+survive a restart either; the gains are config and are.
+
+**Heading hold cannot recover the line, and that is inherent, not a bug.** Heading is
+unobservable in position, so a disturbance that shoves the rover sideways leaves it
+running perfectly parallel along a new, permanently offset line. Reproduced here in
+simulation: shoved 80 mm off with the heading already correct and no drift at all,
+`heading` sits at 280.0 mm for 60 s and never moves; `track` returns to 202.7 mm.
+That is the whole reason `track` exists — do not "fix" heading mode to close it.
+
+### What this branch's firmware is, and the lineage trap
+
+**There are two divergent `rover.ino` lineages and this branch carries a THIRD that
+is the merge of them.** Do not resolve this by blind checkout in either direction.
+
+- **`rover/` here = firmware 2.5.0 = 2.0.0 (the network recovery ladder,
+  `serviceNetwork()` / gateway ping / self-reboot / `test_net.cpp`) + yaw trim + the
+  2026-09-12 wiring.**
+- **`moving_stuff`'s `rover/` = 2.4.1**, which is the same yaw trim on a 2.0.0 that
+  has **no** ladder — it has `ensureLinkHealth()` instead, and it deletes
+  `test_net.cpp` and `rover/test/netstubs/`. Taking that commit wholesale would have
+  reverted the network work this repo's own "The board could never rejoin the network"
+  section records, and dropped the only harness that can test a liveness property.
+- What was ported across is exactly: the yaw trim (ISR, `setYawTrim`, `yaw` in
+  `cfg`/`hello`/`status`, the `trim` command), the per-wheel `H_INVERT_*` direction
+  flags, the pin map and `V_DIR_INVERT` **as set on the rig 2026-09-12**, and
+  `RX_BUFFER_SIZE` 256 -> 320. Nothing networking-related moved.
+- **`RX_BUFFER_SIZE` and the Pi's `BOARD_RX_LIMIT` must agree** (both 320). The `cfg`
+  grew a `yaw` field and a worst-case `cfg` is now 264 bytes; over the limit the board
+  rejects it silently apart from one line in its log — and `cfg` is what carries the
+  **soft limits**, which on a rig with no endstops are the backstop.
+
+### Signs: two flags, and the defaults are consistent with the documented conventions
+
+`+alpha` turns the nose RIGHT (`rover/config.h`) and `bno085.yaw_deg` is CCW-positive,
+so `+alpha` must DECREASE `yaw_deg`. Checked in simulation: with the plant built from
+those two documented conventions the shipped defaults (`yaw_invert` false) converge,
+and `yaw_invert` true diverges to +185 deg in 20 s where open loop reaches only +12.
+So a wrong sign is loud, not subtle — which is what the panel's "if the drift gets
+WORSE, flip it" instruction relies on. **Still verify both signs on the rig**; the
+simulation validates the arithmetic, not the wiring.
+
+`dir` appears TWICE in the control law for different reasons — inner loop because the
+same alpha yaws the chassis the opposite way in reverse, outer loop because a given
+heading moves the rover sideways the opposite way in reverse. Both automatic.
+
+The outer loop is **P-only on purpose**: heading -> lateral position is an integrator,
+so P already drives standoff error to zero at equilibrium, and a second integrator
+would only fight the inner loop's `bias` for authority over the same steady state.
+
+### Degradation is deliberate
+
+A stale IMU holds alpha and steers nothing. A stale or implausible LiDAR drops `track`
+to `heading` behaviour — straight, but not distance-corrected — rather than steering on
+a bad range. LiDAR samples are deduped by `lidar_seq` (which counts MEASUREMENTS, not
+polls — see the LiDAR section above), gated to 40-2000 mm, EMA-filtered, and a single
+>120 mm jump is rejected unless three arrive in a row, which is a real move rather than
+a speckle off the wall.
+
+### Verification
+
+`yaw_control.py` is pure and was exercised head-first (38 checks): wrap, every staleness and stationary gate, forward/reverse sign, both invert
+flags, deadband, the +-30 clamp, the integrator learning a standing bias, the outer
+loop's lean and its clamp, duplicate-`seq` and out-of-window LiDAR rejection, the
+three-outlier re-acquire, `track` degrading to `heading` when the LiDAR goes quiet, and
+the send throttle. Then a closed-loop simulation against a kinematic rover (20 Hz board
+status, 14 Hz LiDAR, a +0.6 deg/s standing drift): open loop runs to 434 mm in 30 s;
+`heading` holds parallel to under 1 deg; `track` returns to the reference within 3.5 mm
+from an 80 mm offset, forward and in reverse. There is still no test runner in this
+repo, so these were throwaway scripts.
+
+**Not run on the rig, and the firmware could not even be compiled here** — there is no
+C++ toolchain on this machine, so `rover/test/build_check.sh` has NOT been run against
+the ported firmware. Run it on the Pi before flashing. What to check on the bench, in
+order: (1) `build_check.sh` passes, including the network harness that was kept; (2)
+nudge each axis 1 mm and confirm the pin map and all four direction flags against the
+rig, since those came from a branch and not from a measurement made here; (3) the two
+steering signs.
+
 ## Rover Scan Panel + firmware (rewritten 2026-08-29)
 
 Panel id `rover` (`RoverPanel.jsx` + `RoverDisplay.jsx`), between `cscan` and `sar`.

@@ -63,6 +63,9 @@ from collections import deque
 
 import websockets
 
+from yaw_control import (YawController, run_yaw_feed,
+                         MODE_MANUAL, MODE_HEADING, MODE_TRACK, MODES)
+
 PORT = 9002
 ARDUINO_PORT = 8765
 
@@ -82,7 +85,7 @@ BOARD_AXIS = {'x': 'h', 'y': 'v'}
 # this side was checking, the rejection was silent apart from one line in the
 # rover log. Mirrored here so an oversized command is caught and named rather
 # than discovered as a config that mysteriously never took effect.
-BOARD_RX_LIMIT = 256
+BOARD_RX_LIMIT = 320        # rover/config.h RX_BUFFER_SIZE, raised 256 -> 320 in firmware 2.5.0
 
 LOG_LINES = 80
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rover_state.json')
@@ -134,6 +137,32 @@ DEFAULT_CONFIG = {
     # no way to notice. Turn it on if the standstill whine from the A4988-class
     # drivers, or their holding-current heat, matters more than that.
     'idle_disable_s': 0.0,
+
+    # Yaw trim, signed percent. The rover's two rear wheels (Z right, A left)
+    # are on separate axles; with no steering, a persistent drift away from
+    # parallel to the wall is corrected open-loop by running one rear wheel a
+    # few percent faster than the other. Positive = nose turns RIGHT (left
+    # rear faster). Pushed to the board as `yaw`; persisted here, not there,
+    # so it survives a board power cycle. Tune by jogging along the wall and
+    # nudging until the gap stays constant.
+    'yaw_trim_pct': 0.0,
+
+    # Closed-loop yaw from the BNO085 (pi/rover/yaw_control.py). Only used
+    # while yaw mode is 'auto' (a command, not a config key -- it must not
+    # survive a restart, since the reference heading does not either).
+    'yaw_kp': 2.0,          # percent of trim per degree of heading error
+    'yaw_ki': 0.2,          # percent per degree per second -- learns the standing drift
+    'yaw_invert': False,    # flip if auto makes the drift WORSE (IMU mounted the other way)
+
+    # Outer loop: LiDAR standoff -> heading offset. Only used in 'track' mode.
+    # Holding HEADING keeps the rover parallel but cannot fix being in the wrong
+    # place -- a sideways disturbance leaves it parallel along a new line. This
+    # closes standoff so the line comes back. See pi/rover/yaw_control.py.
+    'standoff_kd': 0.05,        # degrees of heading offset per mm of range error
+    'standoff_max_deg': 6.0,    # never point more than this at/away from the wall
+    'standoff_deadband_mm': 3.0,
+    'standoff_invert': False,   # flip if track drives AWAY from the target distance
+    'standoff_ref_mm': 0.0,     # 0 = capture wherever the rover is when track engages
 }
 
 # Inclusive (min, max) per numeric setting. Typed into a panel field, an
@@ -155,6 +184,13 @@ CONFIG_BOUNDS = {
     'y_max_mm': (-10000.0, 10000.0),
     'jog_hold_ms': (100.0, 5000.0),
     'idle_disable_s': (0.0, 3600.0),
+    'yaw_trim_pct': (-30.0, 30.0),      # mirrors YAW_TRIM_MAX_PCT in rover/config.h
+    'yaw_kp': (0.0, 10.0),
+    'yaw_ki': (0.0, 2.0),
+    'standoff_kd': (0.0, 1.0),
+    'standoff_max_deg': (0.0, 20.0),
+    'standoff_deadband_mm': (0.0, 50.0),
+    'standoff_ref_mm': (0.0, 2000.0),
 }
 
 
@@ -171,6 +207,11 @@ class Rover:
         # -- nothing here integrates commands to guess at position.
         self.steps = {'x': 0, 'y': 0}
         self.speed_steps = {'x': 0.0, 'y': 0.0}
+        # Closed-loop yaw. Manual until told otherwise; the IMU feed task
+        # (run_yaw_feed) keeps it supplied with headings whether or not it is
+        # engaged, so switching to auto has a reference immediately.
+        self.yaw = YawController()
+        self._board_yaw = None          # the trim the board last reported holding
         self.mode = {'x': 'idle', 'y': 'idle'}
         self.stop_reason = {'x': 'none', 'y': 'none'}
         self.moving = False
@@ -386,6 +427,8 @@ class Rover:
             'position_conflict': self.position_conflict,
             'board_pos_valid': self.board_pos_valid,
             'last_status_at': self.last_status_at,
+            'yaw': {**self.yaw.snapshot(), 'manual_pct': int(round(self.config['yaw_trim_pct'])),
+                    'board_pct': self._board_yaw},
             'moves_done': self.moves_done,
             'last_done_seq': self.last_done_seq,
             'last_done_reason': self.last_done_reason,
@@ -543,7 +586,11 @@ class Rover:
             v_lo=y_lo, v_hi=y_hi,
             limits=bool(self.config['limits_enabled']),
             idle_ms=int(self.config['idle_disable_s'] * 1000),
+            # Integer percent. ~10 bytes at the extreme ("yaw":-30); measured
+            # against the 256-byte board buffer below in _check_cfg_size.
+            yaw=self.effective_yaw(),
         )
+        self.yaw.mark_sent(self.effective_yaw())
 
     def _ingest_status(self, msg):
         if int(msg.get('seq', 0)) < self._status_gate_seq:
@@ -555,6 +602,7 @@ class Rover:
                 self.travel_mm += abs(new[ax] - self._last_steps[ax]) / self.spmm(ax)
         self._last_steps = dict(new)
         self.steps = new
+        self._board_yaw = msg.get('yaw', self._board_yaw)
         self.speed_steps['x'] = float(msg.get('h_spd', 0.0))
         self.speed_steps['y'] = float(msg.get('v_spd', 0.0))
         self.mode['x'] = AXIS_MODE.get(int(msg.get('h_mode', 0)), '?')
@@ -667,6 +715,7 @@ class Rover:
                 kind = msg.get('t')
                 if kind == 'status':
                     if self._ingest_status(msg):
+                        await self._yaw_tick()
                         await self.pump()
                         await self.broadcast()
                     continue          # 20 Hz; far too chatty for the log
@@ -908,6 +957,72 @@ class Rover:
         self._save_state()
         await self.push_config()
 
+    def _sync_yaw_gains(self):
+        self.yaw.kp = float(self.config['yaw_kp'])
+        self.yaw.ki = float(self.config['yaw_ki'])
+        self.yaw.invert = bool(self.config['yaw_invert'])
+        self.yaw.kd = float(self.config['standoff_kd'])
+        self.yaw.psi_max = float(self.config['standoff_max_deg'])
+        self.yaw.standoff_deadband = float(self.config['standoff_deadband_mm'])
+        self.yaw.standoff_invert = bool(self.config['standoff_invert'])
+        ref = float(self.config['standoff_ref_mm'])
+        # 0 means "capture on engage"; anything else is an explicit target.
+        self.yaw.standoff_ref = ref if ref > 0 else self.yaw.standoff_ref
+
+    def effective_yaw(self):
+        """What the board should hold right now: the loop's alpha when a loop is
+        running, the operator's number in manual."""
+        if self.yaw.mode != MODE_MANUAL:
+            return int(round(self.yaw.alpha))
+        return int(round(self.config['yaw_trim_pct']))
+
+    async def set_yaw_mode(self, mode):
+        was = self.yaw.mode
+        if mode == MODE_MANUAL and was != MODE_MANUAL:
+            # Keep what the loop learned as the new manual value, so flipping
+            # back does not throw the tuning away.
+            self.config['yaw_trim_pct'] = float(self.effective_yaw())
+        ok, reason = self.yaw.set_mode(mode, seed_alpha=self.config['yaw_trim_pct'])
+        if not ok:
+            self._last_error = f"cannot engage {mode}: {reason}"
+            self._note(self._last_error)
+            return False
+        if self.yaw.mode == MODE_MANUAL:
+            self._save_state()
+            self._note(f"steering: MANUAL, keeping learned {self.effective_yaw():+d}%")
+        elif self.yaw.mode == MODE_HEADING:
+            self._note(f"steering: HEADING hold at {self.yaw.yaw_ref:.2f} deg, "
+                       f"seed {self.effective_yaw():+d}%")
+        else:
+            self._note(f"steering: TRACK, heading {self.yaw.yaw_ref:.2f} deg, "
+                       f"standoff {self.yaw.standoff_ref:.0f} mm")
+        if self.board is not None:
+            await self.push_config()
+        return True
+
+    async def hold_standoff(self, mm=None):
+        if not self.yaw.hold_standoff(mm):
+            self._last_error = "cannot set standoff: no LiDAR range yet"
+            self._note(self._last_error)
+            return False
+        self.config['standoff_ref_mm'] = float(self.yaw.standoff_ref)
+        self._save_state()
+        self._note(f"standoff target set to {self.yaw.standoff_ref:.0f} mm")
+        return True
+
+    async def _yaw_tick(self):
+        """Called on every board status frame: advance the loop and send a new
+        alpha if it changed. Cheap when manual (returns immediately)."""
+        if self.yaw.mode == MODE_MANUAL or self.board is None:
+            return
+        alpha = self.yaw.update(self.speed_steps['x'] / self.spmm('x'))
+        if alpha is None:
+            return
+        try:
+            await self.send_board(c='trim', yaw=int(alpha))
+        except RuntimeError:
+            pass
+
     def set_config(self, updates):
         changed = False
         for k, v in updates.items():
@@ -935,6 +1050,7 @@ class Rover:
                     self.config[hi_key], self.config[lo_key])
                 self._note(f"{lo_key} exceeded {hi_key} -- swapped")
         if changed:
+            self._sync_yaw_gains()
             self._save_state()
         return changed
 
@@ -980,6 +1096,25 @@ async def dispatch(rover, ws, cmd):
         if action == 'rover_set_config':
             if rover.set_config(cmd.get('config') or {}) and rover.board is not None:
                 await rover.push_config()
+            await rover.broadcast()
+            return
+
+        if action == 'rover_yaw_mode':
+            await rover.set_yaw_mode(cmd.get('mode'))
+            await rover.broadcast()
+            return
+
+        if action == 'rover_standoff_hold':
+            mm = cmd.get('mm')
+            await rover.hold_standoff(None if mm in (None, 0) else float(mm))
+            await rover.broadcast()
+            return
+
+        if action == 'rover_yaw_zero':
+            if rover.yaw.zero():
+                rover._note(f"yaw: reference re-declared at {rover.yaw.yaw_ref:.2f} deg")
+            else:
+                rover._last_error = "cannot zero heading: no IMU heading yet"
             await rover.broadcast()
             return
 
@@ -1030,9 +1165,14 @@ async def main():
                         help=f'port the controller dials in on (default: {ARDUINO_PORT})')
     parser.add_argument('--no-persist', action='store_true',
                         help='do not load or save rover_state.json')
+    parser.add_argument('--sensors-url', default='ws://127.0.0.1:9001',
+                        help='sensor stream to take IMU heading from (default: ws://127.0.0.1:9001)')
     args = parser.parse_args()
 
     rover = Rover(persist=not args.no_persist)
+    rover._sync_yaw_gains()
+    yaw_feed = asyncio.create_task(run_yaw_feed(rover.yaw, args.sensors_url,
+                                                note=lambda m: print(f"[rover] {m}")))
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
 
@@ -1052,6 +1192,11 @@ async def main():
                                 ping_interval=20, ping_timeout=20):
         await stop
 
+    yaw_feed.cancel()
+    try:
+        await yaw_feed
+    except (asyncio.CancelledError, Exception):
+        pass
     rover._save_state()
     print("\n[rover] stopped.")
 
