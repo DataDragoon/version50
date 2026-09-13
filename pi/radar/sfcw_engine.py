@@ -463,23 +463,20 @@ class SFCWEngine:
         # division. It also removes the ring-overflow fallback by
         # construction -- there is no continuous capture to overflow.
         #
-        # NOT the default. 'dsp' has never completed a sweep on hardware, and
-        # defaulting to it made every startup depend on it -- the raw path is
-        # the one that is known to work and it stays in charge until 'dsp' has
-        # proven itself.
+        # THE DEFAULT as of 2026-09-13. It was opt-in while it had never
+        # completed a sweep on hardware; it has since run at 100 Hz with
+        # correlation 1.0 on the v13 stepper image (accum-1200), so a startup
+        # no longer needs set_sweep_mode.py. The image must be v10 or later
+        # (bit 6 reads back) -- check_bit6.py says so. On an older image the
+        # dsp core reports why it cannot run and every sweep falls back, so
+        # switch back with:
         #
-        # Select it explicitly, and only when FPGA v7+ is flashed:
-        #
-        #     {"sweep_mode": "dsp"}      over the sdr_server WebSocket
+        #     {"sweep_mode": "nios"}     over the sdr_server WebSocket
+        #     (python3 radar/set_sweep_mode.py nios)
         #
         # then stop and restart the sweep -- the sample format is fixed when
         # the stream is configured, so the mode cannot cross on a live stream.
-        # Switch back with {"sweep_mode": "nios"}.
-        #
-        # v5/v6 cannot run it at all: without the Nios toggling RFFE GPO bit 24
-        # on every retune the accumulators never restart and the DSP FIFO never
-        # fills.
-        self.sweep_mode = 'nios'
+        self.sweep_mode = 'dsp'
         self.nios_dwell = 4096        # samples per step, rounded to 64 -- see NIOS_MIN_DWELL
         # dsp mode has its own dwell and chain counts (v12); see DSP_DEFAULT_*.
         self.dsp_dwell = DSP_DEFAULT_DWELL
