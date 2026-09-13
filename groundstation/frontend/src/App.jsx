@@ -2409,7 +2409,6 @@ export default function App() {
         bgApplied={bgApplied}
         onBgAppliedChange={setBgApplied}
         bscanParams={bscanParams}
-        cscanFocusParams={cscanFocusParams}
         onBscanParamsChange={setBscanParams}
         onBscanAction={handleBscanAction}
         roverScan={roverScan}
@@ -2571,6 +2570,7 @@ export default function App() {
         bscanBgSubMode={bscanBgSubMode}
         cscanSharedScale={cscanSharedScale}
         bscanParams={bscanParams}
+        cscanFocusParams={cscanFocusParams}
         bscanCapturing={bscanCapturing}
         roverScan={roverScan}
         bscanScaleMode={bscanScaleMode}
