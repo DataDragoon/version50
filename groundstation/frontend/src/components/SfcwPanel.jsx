@@ -106,6 +106,16 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
     if (coherenceResult) setCoherenceRunning(false);
   }, [coherenceResult]);
 
+  // Never stay on "Running..." forever: 100 sweeps take ~2-3 s, and the
+  // server refuses the request outright while a sweep is running (its
+  // 'error' reply is routed into coherenceResult by App.jsx). 30 s is far
+  // beyond any legitimate run.
+  useEffect(() => {
+    if (!coherenceRunning) return undefined;
+    const t = setTimeout(() => setCoherenceRunning(false), 30000);
+    return () => clearTimeout(t);
+  }, [coherenceRunning]);
+
   useEffect(() => {
     if (lidarMm == null) return;
     const buf = lidarBuf.current;
@@ -623,9 +633,14 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               : 'bg-white/2 border border-white/5 text-white/20 cursor-not-allowed'
           )}
         >
-          {coherenceRunning ? 'Running (3 sweeps)...' : 'Run Coherence Test'}
+          {coherenceRunning ? 'Running (100 sweeps)...' : 'Run Coherence Test'}
         </button>
-        {coherenceResult && (
+        {coherenceResult?.error && (
+          <div className="mt-2 text-[10px] text-[#f59e0b] px-1">
+            {coherenceResult.error}
+          </div>
+        )}
+        {coherenceResult && !coherenceResult.error && (
           <div className="mt-2 space-y-1">
             <div className="grid grid-cols-2 gap-2">
               <InfoTile
@@ -636,11 +651,27 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
                 label="Correlation"
                 value={coherenceResult.avg_correlation?.toFixed(3)}
               />
+              <InfoTile
+                label="Min corr"
+                value={coherenceResult.min_correlation?.toFixed(3)}
+              />
+              <InfoTile
+                label="S_repeat"
+                value={Number.isFinite(coherenceResult.s_repeat_db)
+                  ? `${coherenceResult.s_repeat_db.toFixed(1)} dB`
+                  : '--'}
+              />
             </div>
             <div className="text-[9px] text-[#555] px-1 space-y-0.5">
-              <div>Repeatability: {coherenceResult.repeatability?.map(r => r.toFixed(3)).join(', ')}</div>
-              <div>Correlation: {coherenceResult.correlation?.map(c => c.toFixed(3)).join(', ')}</div>
-              <div className="text-[#777] mt-1">1.0 = perfect, {'>'} 0.9 = good</div>
+              <div>
+                {coherenceResult.num_sweeps} of {coherenceResult.requested_sweeps ?? coherenceResult.num_sweeps} sweeps scored
+                {coherenceResult.sweep_cores && (
+                  <> ({Object.entries(coherenceResult.sweep_cores).map(([k, v]) => `${k}: ${v}`).join(', ')})</>
+                )}
+              </div>
+              <div className="text-[#777] mt-1">
+                correlation 1.0 = perfect, {'>'} 0.9 = good; S_repeat: signal over adjacent-sweep difference
+              </div>
             </div>
           </div>
         )}
